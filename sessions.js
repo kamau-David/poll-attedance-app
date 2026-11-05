@@ -8,6 +8,11 @@ const CODE_LENGTH = 5;
 const MAX_NAME_LENGTH = 50;
 const MAX_REG_LENGTH = 30;
 
+const MAX_QUESTION_LENGTH = 200;
+const MAX_OPTION_LENGTH = 100;
+const MIN_OPTIONS = 2;
+const MAX_OPTIONS = 6;
+
 const sessions = new Map(); // code -> session
 
 function generateCode() {
@@ -34,6 +39,7 @@ function createSession(hostSocketId, title) {
     createdAt: new Date().toISOString(),
     status: "open", // "open" | "ended"
     attendees: new Map(), // key -> attendee
+    polls: [], // every poll asked in this session, in order
   };
   sessions.set(code, session);
   return session;
@@ -48,6 +54,13 @@ function endSession(code) {
   if (!session) return null;
   session.status = "ended";
   session.endedAt = new Date().toISOString();
+
+  // A poll can't stay open after its session is over
+  const openPoll = getOpenPoll(session);
+  if (openPoll) {
+    openPoll.status = "closed";
+    openPoll.closedAt = session.endedAt;
+  }
   return session;
 }
 
@@ -132,6 +145,115 @@ function attendanceSummary(session) {
   };
 }
 
+// ---------- Polls ----------
+
+function getOpenPoll(session) {
+  return session.polls.find((p) => p.status === "open");
+}
+
+function findPoll(session, pollId) {
+  return session.polls.find((p) => p.id === Number(pollId));
+}
+
+function createPoll(session, { question, options }) {
+  const cleanQuestion = String(question || "").trim();
+  if (!cleanQuestion) return { ok: false, error: "Question is required" };
+  if (cleanQuestion.length > MAX_QUESTION_LENGTH) {
+    return { ok: false, error: `Question must be ${MAX_QUESTION_LENGTH} characters or fewer` };
+  }
+
+  if (!Array.isArray(options)) {
+    return { ok: false, error: "Options must be a list" };
+  }
+  const cleanOptions = options.map((o) => String(o == null ? "" : o).trim());
+  if (cleanOptions.length < MIN_OPTIONS || cleanOptions.length > MAX_OPTIONS) {
+    return { ok: false, error: `A poll needs ${MIN_OPTIONS} to ${MAX_OPTIONS} options` };
+  }
+  if (cleanOptions.some((o) => !o)) {
+    return { ok: false, error: "Options cannot be empty" };
+  }
+  if (cleanOptions.some((o) => o.length > MAX_OPTION_LENGTH)) {
+    return { ok: false, error: `Each option must be ${MAX_OPTION_LENGTH} characters or fewer` };
+  }
+
+  if (getOpenPoll(session)) {
+    return { ok: false, error: "A poll is already open. Close it first" };
+  }
+
+  const poll = {
+    id: session.polls.length + 1,
+    question: cleanQuestion,
+    options: cleanOptions,
+    status: "open", // "open" | "closed"
+    votes: new Map(), // attendee key -> option index (one vote each)
+    createdAt: new Date().toISOString(),
+    closedAt: null,
+  };
+  session.polls.push(poll);
+  return { ok: true, poll };
+}
+
+// A student may change their vote while the poll is open (last vote wins),
+// but can never vote twice because votes are stored per attendee key.
+function castVote(session, pollId, attendeeKeyValue, option) {
+  const poll = findPoll(session, pollId);
+  if (!poll) return { ok: false, error: "Poll not found" };
+  if (poll.status !== "open") return { ok: false, error: "Poll is closed" };
+  if (!Number.isInteger(option) || option < 0 || option >= poll.options.length) {
+    return { ok: false, error: "Invalid option" };
+  }
+  poll.votes.set(attendeeKeyValue, option);
+  return { ok: true, poll, option };
+}
+
+function closePoll(session, pollId) {
+  const poll = findPoll(session, pollId);
+  if (!poll) return { ok: false, error: "Poll not found" };
+  if (poll.status !== "open") return { ok: false, error: "Poll is already closed" };
+  poll.status = "closed";
+  poll.closedAt = new Date().toISOString();
+  return { ok: true, poll };
+}
+
+function myVote(session, attendeeKeyValue) {
+  const poll = getOpenPoll(session);
+  if (!poll) return null;
+  const vote = poll.votes.get(attendeeKeyValue);
+  return vote === undefined ? null : vote;
+}
+
+// What STUDENTS see while voting: the question and options, no counts.
+// (Showing live counts to students would let them copy the crowd.)
+function pollView(poll) {
+  return {
+    id: poll.id,
+    question: poll.question,
+    options: poll.options,
+    status: poll.status,
+  };
+}
+
+// What the HOST sees (and what everyone sees once the poll is closed)
+function pollResults(session, poll) {
+  const counts = poll.options.map(() => 0);
+  for (const choice of poll.votes.values()) counts[choice]++;
+  return {
+    pollId: poll.id,
+    question: poll.question,
+    options: poll.options,
+    status: poll.status,
+    counts,
+    totalVotes: poll.votes.size,
+    totalAttendees: session.attendees.size,
+    createdAt: poll.createdAt,
+    closedAt: poll.closedAt,
+  };
+}
+
+function listPolls(session) {
+  return session.polls.map((p) => pollResults(session, p));
+}
+
 module.exports = {
   createSession,
   getSession,
@@ -141,4 +263,12 @@ module.exports = {
   addAttendee,
   markOffline,
   attendanceSummary,
+  getOpenPoll,
+  createPoll,
+  castVote,
+  closePoll,
+  myVote,
+  pollView,
+  pollResults,
+  listPolls,
 };
