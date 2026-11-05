@@ -1,3 +1,5 @@
+const crypto = require("crypto");
+
 // In-memory session store. Everything resets when the server restarts,
 // which is fine for a club session. We can add a database later.
 
@@ -12,6 +14,10 @@ const MAX_QUESTION_LENGTH = 200;
 const MAX_OPTION_LENGTH = 100;
 const MIN_OPTIONS = 2;
 const MAX_OPTIONS = 6;
+
+// How long sessions are kept before cleanup removes them
+const OPEN_SESSION_TTL_MS = 12 * 60 * 60 * 1000; // a session left open for 12 hours
+const ENDED_SESSION_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours after ending (time to export)
 
 const sessions = new Map(); // code -> session
 
@@ -36,6 +42,9 @@ function createSession(hostSocketId, title) {
     code,
     title: (title || "").trim() || "Untitled session",
     hostSocketId,
+    // Secret only the host knows. It proves "I am the host" even after the
+    // host's connection drops and they get a new socket id.
+    hostToken: crypto.randomBytes(16).toString("hex"),
     createdAt: new Date().toISOString(),
     status: "open", // "open" | "ended"
     attendees: new Map(), // key -> attendee
@@ -47,6 +56,14 @@ function createSession(hostSocketId, title) {
 
 function getSession(code) {
   return sessions.get(normalizeCode(code));
+}
+
+// Constant-time comparison so response timing can't leak the token
+function isHostToken(session, token) {
+  if (typeof token !== "string" || !token) return false;
+  const given = Buffer.from(token);
+  const real = Buffer.from(session.hostToken);
+  return given.length === real.length && crypto.timingSafeEqual(given, real);
 }
 
 function endSession(code) {
@@ -64,7 +81,24 @@ function endSession(code) {
   return session;
 }
 
-// What we are happy to show to students (never expose socket ids)
+// Removes sessions that are too old. `now` can be passed in so tests can
+// pretend time has passed. Returns what was removed.
+function cleanupSessions(now = Date.now()) {
+  const removed = [];
+  for (const [code, session] of sessions) {
+    const expired =
+      session.status === "ended"
+        ? now - Date.parse(session.endedAt) > ENDED_SESSION_TTL_MS
+        : now - Date.parse(session.createdAt) > OPEN_SESSION_TTL_MS;
+    if (expired) {
+      sessions.delete(code);
+      removed.push({ code, wasOpen: session.status === "open" });
+    }
+  }
+  return removed;
+}
+
+// What we are happy to show to students (never expose socket ids or the host token)
 function publicView(session) {
   return {
     code: session.code,
@@ -257,7 +291,9 @@ function listPolls(session) {
 module.exports = {
   createSession,
   getSession,
+  isHostToken,
   endSession,
+  cleanupSessions,
   normalizeCode,
   publicView,
   addAttendee,
