@@ -3,8 +3,10 @@ const http = require("http");
 const cors = require("cors");
 const { Server } = require("socket.io");
 const sessions = require("./sessions");
+const reports = require("./reports");
 
 const PORT = process.env.PORT || 3000;
+const CLEANUP_INTERVAL_MS = 10 * 60 * 1000; // check for old sessions every 10 minutes
 
 const app = express();
 app.use(cors());
@@ -28,13 +30,55 @@ app.get("/sessions/:code", (req, res) => {
   res.json({ ok: true, session: sessions.publicView(session) });
 });
 
+// Host-only HTTP routes need the host token, sent as an "x-host-token" header
+// (or a ?token= query parameter so a plain download link also works).
+// Returns the session, or sends the error response and returns null.
+function authorizeHostRequest(req, res) {
+  const session = sessions.getSession(req.params.code);
+  if (!session) {
+    res.status(404).json({ ok: false, error: "Session not found" });
+    return null;
+  }
+  const token = req.get("x-host-token") || req.query.token;
+  if (!sessions.isHostToken(session, token)) {
+    res.status(403).json({ ok: false, error: "Invalid host token" });
+    return null;
+  }
+  return session;
+}
+
+function sendCsv(res, filename, csv) {
+  res.set({
+    "Content-Type": "text/csv; charset=utf-8",
+    "Content-Disposition": `attachment; filename="${filename}"`,
+  });
+  res.send(csv);
+}
+
+// HOST: download attendance as CSV
+app.get("/sessions/:code/attendance.csv", (req, res) => {
+  const session = authorizeHostRequest(req, res);
+  if (!session) return;
+  const csv = reports.attendanceCsv(sessions.attendanceSummary(session));
+  sendCsv(res, `attendance-${session.code}.csv`, csv);
+});
+
+// HOST: download poll results as CSV
+app.get("/sessions/:code/polls.csv", (req, res) => {
+  const session = authorizeHostRequest(req, res);
+  if (!session) return;
+  const csv = reports.pollsCsv(sessions.listPolls(session));
+  sendCsv(res, `polls-${session.code}.csv`, csv);
+});
+
 const server = http.createServer(app);
 
 const io = new Server(server, {
   cors: { origin: "*" }, // fine for local club use; tighten later
 });
 
-const roomOf = (session) => `session:${session.code}`;
+const roomForCode = (code) => `session:${code}`;
+const roomOf = (session) => roomForCode(session.code);
 
 // Send the latest attendance list to the HOST only.
 // Students never receive other students' names.
@@ -67,13 +111,39 @@ io.on("connection", (socket) => {
     socket.emit("pong-server", { time: new Date().toISOString() });
   });
 
-  // HOST: create a new session -> gets a join code back
+  // HOST: create a new session -> gets a join code and a secret host token.
+  // The host app must keep the token (it is how the host reconnects and exports).
   socket.on("session:create", (payload, ack) => {
     if (typeof ack !== "function") return;
     const session = sessions.createSession(socket.id, payload && payload.title);
     socket.join(roomOf(session));
     console.log(`Session ${session.code} created: "${session.title}"`);
-    ack({ ok: true, session: sessions.publicView(session) });
+    ack({ ok: true, session: sessions.publicView(session), hostToken: session.hostToken });
+  });
+
+  // HOST: take control of an existing session again after a dropped connection.
+  // The new socket becomes the host, and the old one loses host powers.
+  socket.on("session:resume", (payload, ack) => {
+    if (typeof ack !== "function") return;
+    const data = payload || {};
+    const session = sessions.getSession(data.code);
+    if (!session) return ack({ ok: false, error: "Session not found" });
+    if (!sessions.isHostToken(session, data.hostToken)) {
+      return ack({ ok: false, error: "Invalid host token" });
+    }
+
+    session.hostSocketId = socket.id;
+    socket.join(roomOf(session));
+    console.log(`Host resumed session ${session.code}`);
+
+    const openPoll = sessions.getOpenPoll(session);
+    ack({
+      ok: true,
+      session: sessions.publicView(session),
+      attendance: sessions.attendanceSummary(session),
+      polls: sessions.listPolls(session),
+      openPollId: openPoll ? openPoll.id : null,
+    });
   });
 
   // ANYONE: check whether a code is valid and still open
@@ -233,6 +303,15 @@ io.on("connection", (socket) => {
     }
   });
 });
+
+// Remove old sessions now and then so memory doesn't grow forever.
+// unref() means this timer alone never keeps the process alive.
+setInterval(() => {
+  for (const { code, wasOpen } of sessions.cleanupSessions()) {
+    console.log(`Cleaned up old session ${code}`);
+    if (wasOpen) io.to(roomForCode(code)).emit("session:ended", { code });
+  }
+}, CLEANUP_INTERVAL_MS).unref();
 
 // 0.0.0.0 lets phones on the same Wi-Fi reach the server later
 server.listen(PORT, "0.0.0.0", () => {
