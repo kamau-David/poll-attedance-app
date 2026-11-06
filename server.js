@@ -6,13 +6,12 @@ const sessions = require("./sessions");
 const reports = require("./reports");
 
 const PORT = process.env.PORT || 3000;
-const CLEANUP_INTERVAL_MS = 10 * 60 * 1000; // check for old sessions every 10 minutes
-
+const CLEANUP_INTERVAL_MS = 10 * 60 * 1000; // this checks for old sessions after every ten minutes 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Health check: open http://localhost:3000/health in a browser
+
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
@@ -21,7 +20,6 @@ app.get("/health", (req, res) => {
   });
 });
 
-// Students can check a code before joining: GET /sessions/ABCDE
 app.get("/sessions/:code", (req, res) => {
   const session = sessions.getSession(req.params.code);
   if (!session) {
@@ -30,9 +28,7 @@ app.get("/sessions/:code", (req, res) => {
   res.json({ ok: true, session: sessions.publicView(session) });
 });
 
-// Host-only HTTP routes need the host token, sent as an "x-host-token" header
-// (or a ?token= query parameter so a plain download link also works).
-// Returns the session, or sends the error response and returns null.
+
 function authorizeHostRequest(req, res) {
   const session = sessions.getSession(req.params.code);
   if (!session) {
@@ -55,7 +51,7 @@ function sendCsv(res, filename, csv) {
   res.send(csv);
 }
 
-// HOST: download attendance as CSV
+
 app.get("/sessions/:code/attendance.csv", (req, res) => {
   const session = authorizeHostRequest(req, res);
   if (!session) return;
@@ -63,7 +59,7 @@ app.get("/sessions/:code/attendance.csv", (req, res) => {
   sendCsv(res, `attendance-${session.code}.csv`, csv);
 });
 
-// HOST: download poll results as CSV
+
 app.get("/sessions/:code/polls.csv", (req, res) => {
   const session = authorizeHostRequest(req, res);
   if (!session) return;
@@ -74,25 +70,23 @@ app.get("/sessions/:code/polls.csv", (req, res) => {
 const server = http.createServer(app);
 
 const io = new Server(server, {
-  cors: { origin: "*" }, // fine for local club use; tighten later
+  cors: { origin: "*" }, 
 });
 
 const roomForCode = (code) => `session:${code}`;
 const roomOf = (session) => roomForCode(session.code);
 
-// Send the latest attendance list to the HOST only.
-// Students never receive other students' names.
+
 function notifyHost(session) {
   io.to(session.hostSocketId).emit("attendance:updated", sessions.attendanceSummary(session));
 }
 
-// Send live poll results to the HOST only while voting is open.
+
 function notifyHostResults(session, poll) {
   io.to(session.hostSocketId).emit("poll:results", sessions.pollResults(session, poll));
 }
 
-// Shared check for host-only poll actions.
-// Returns { session } on success or { error } on failure.
+
 function hostSessionOrError(socket, code) {
   const session = sessions.getSession(code);
   if (!session) return { error: "Session not found" };
@@ -111,8 +105,7 @@ io.on("connection", (socket) => {
     socket.emit("pong-server", { time: new Date().toISOString() });
   });
 
-  // HOST: create a new session -> gets a join code and a secret host token.
-  // The host app must keep the token (it is how the host reconnects and exports).
+  
   socket.on("session:create", (payload, ack) => {
     if (typeof ack !== "function") return;
     const session = sessions.createSession(socket.id, payload && payload.title);
@@ -121,8 +114,7 @@ io.on("connection", (socket) => {
     ack({ ok: true, session: sessions.publicView(session), hostToken: session.hostToken });
   });
 
-  // HOST: take control of an existing session again after a dropped connection.
-  // The new socket becomes the host, and the old one loses host powers.
+
   socket.on("session:resume", (payload, ack) => {
     if (typeof ack !== "function") return;
     const data = payload || {};
@@ -146,7 +138,7 @@ io.on("connection", (socket) => {
     });
   });
 
-  // ANYONE: check whether a code is valid and still open
+  
   socket.on("session:check", (payload, ack) => {
     if (typeof ack !== "function") return;
     const session = sessions.getSession(payload && payload.code);
@@ -155,7 +147,7 @@ io.on("connection", (socket) => {
     ack({ ok: true, session: sessions.publicView(session) });
   });
 
-  // STUDENT: join a session and be marked present
+ 
   socket.on("session:join", (payload, ack) => {
     if (typeof ack !== "function") return;
     const data = payload || {};
@@ -164,7 +156,7 @@ io.on("connection", (socket) => {
     if (!session) return ack({ ok: false, error: "Session not found" });
     if (session.status !== "open") return ack({ ok: false, error: "Session has ended" });
 
-    // One session per connection (rejoining the same one is fine)
+    
     const current = socket.data.joined;
     if (current && current.code !== session.code) {
       return ack({ ok: false, error: "Already joined a different session" });
@@ -199,7 +191,7 @@ io.on("connection", (socket) => {
     });
   });
 
-  // HOST ONLY: fetch the current attendance list on demand
+  
   socket.on("attendance:get", (payload, ack) => {
     if (typeof ack !== "function") return;
     const session = sessions.getSession(payload && payload.code);
@@ -210,7 +202,7 @@ io.on("connection", (socket) => {
     ack({ ok: true, attendance: sessions.attendanceSummary(session) });
   });
 
-  // HOST ONLY: start a poll -> every student in the session receives it
+ 
   socket.on("poll:create", (payload, ack) => {
     if (typeof ack !== "function") return;
     const data = payload || {};
@@ -231,14 +223,14 @@ io.on("connection", (socket) => {
     ack({ ok: true, poll: sessions.pollResults(session, result.poll) });
   });
 
-  // STUDENT: vote (or change a vote) on the open poll
+  
   socket.on("poll:vote", (payload, ack) => {
     if (typeof ack !== "function") return;
     const data = payload || {};
     const session = sessions.getSession(data.code);
     if (!session) return ack({ ok: false, error: "Session not found" });
 
-    // Only students who joined THIS session can vote in it
+    
     const joined = socket.data.joined;
     if (!joined || joined.code !== session.code) {
       return ack({ ok: false, error: "Join the session first" });
@@ -251,7 +243,7 @@ io.on("connection", (socket) => {
     ack({ ok: true, option: result.option });
   });
 
-  // HOST ONLY: close the poll -> everyone receives the final results
+  
   socket.on("poll:close", (payload, ack) => {
     if (typeof ack !== "function") return;
     const data = payload || {};
@@ -268,7 +260,7 @@ io.on("connection", (socket) => {
     ack({ ok: true, results });
   });
 
-  // HOST ONLY: every poll asked so far, with results (useful after a reload)
+  
   socket.on("poll:list", (payload, ack) => {
     if (typeof ack !== "function") return;
     const found = hostSessionOrError(socket, payload && payload.code);
@@ -276,7 +268,7 @@ io.on("connection", (socket) => {
     ack({ ok: true, polls: sessions.listPolls(found.session) });
   });
 
-  // HOST ONLY: end a session
+  
   socket.on("session:end", (payload, ack) => {
     if (typeof ack !== "function") return;
     const session = sessions.getSession(payload && payload.code);
@@ -293,7 +285,7 @@ io.on("connection", (socket) => {
   socket.on("disconnect", () => {
     console.log(`Client disconnected: ${socket.id}`);
 
-    // If this was a student, mark them offline (we keep their attendance record)
+    
     const joined = socket.data.joined;
     if (joined) {
       const session = sessions.getSession(joined.code);
@@ -304,8 +296,7 @@ io.on("connection", (socket) => {
   });
 });
 
-// Remove old sessions now and then so memory doesn't grow forever.
-// unref() means this timer alone never keeps the process alive.
+
 setInterval(() => {
   for (const { code, wasOpen } of sessions.cleanupSessions()) {
     console.log(`Cleaned up old session ${code}`);
@@ -313,7 +304,7 @@ setInterval(() => {
   }
 }, CLEANUP_INTERVAL_MS).unref();
 
-// 0.0.0.0 lets phones on the same Wi-Fi reach the server later
+
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on http://localhost:${PORT}`);
 });
